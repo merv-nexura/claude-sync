@@ -70,17 +70,6 @@ type Config struct {
 	//     ~/Projects: WORK
 	PathMap map[string]string `yaml:"path_map,omitempty"`
 
-	// PathMap maps local directory prefixes to shared token names so project
-	// sessions stay resumable across devices with different layouts.
-	// The home directory is always mapped (token HOME); add entries here when
-	// project roots differ beyond that, e.g.:
-	//   path_map:
-	//     ~/work: WORK        # this device keeps projects in ~/work
-	// with the other device mapping its own location to the same token:
-	//   path_map:
-	//     ~/Projects: WORK
-	PathMap map[string]string `yaml:"path_map,omitempty"`
-
 	// ClaudeDirOverride allows overriding the default ~/.claude path (for testing)
 	ClaudeDirOverride string `yaml:"-"`
 
