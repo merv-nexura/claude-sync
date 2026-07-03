@@ -20,8 +20,10 @@ import (
 	"github.com/AlecAivazis/survey/v2"
 	"github.com/spf13/cobra"
 
+	"github.com/tawanorg/claude-sync/internal/claudesettings"
 	"github.com/tawanorg/claude-sync/internal/config"
 	"github.com/tawanorg/claude-sync/internal/crypto"
+	"github.com/tawanorg/claude-sync/internal/paths"
 	"github.com/tawanorg/claude-sync/internal/storage"
 	"github.com/tawanorg/claude-sync/internal/sync"
 	"github.com/tawanorg/claude-sync/internal/util"
@@ -30,6 +32,7 @@ import (
 	_ "github.com/tawanorg/claude-sync/internal/storage/gcs"
 	_ "github.com/tawanorg/claude-sync/internal/storage/r2"
 	_ "github.com/tawanorg/claude-sync/internal/storage/s3"
+	_ "github.com/tawanorg/claude-sync/internal/storage/webdav"
 )
 
 var (
@@ -69,6 +72,8 @@ func main() {
 		updateCmd(),
 		changelogCmd(),
 		mcpCmd(),
+		autoCmd(),
+		pathsCmd(),
 	)
 
 	if err := rootCmd.Execute(); err != nil {
@@ -114,6 +119,7 @@ func printWarning(text string) {
 
 func initCmd() *cobra.Command {
 	var provider, bucket string
+	var scope string
 	var usePassphrase, force bool
 
 	// R2 flags
@@ -122,8 +128,14 @@ func initCmd() *cobra.Command {
 	// S3 flags
 	var s3Region string
 
+	// S3-compatible (custom endpoint) flags
+	var s3Endpoint string
+
 	// GCS flags
 	var gcsProjectID, gcsCredentialsFile string
+
+	// WebDAV flags
+	var webdavURL, webdavUsername, webdavPassword, webdavPathPrefix string
 
 	cmd := &cobra.Command{
 		Use:   "init",
@@ -131,14 +143,17 @@ func initCmd() *cobra.Command {
 		Long: `Set up cloud storage credentials and generate encryption keys.
 
 Supported providers:
-  - r2:  Cloudflare R2 (S3-compatible, free tier: 10GB)
-  - s3:  Amazon S3
-  - gcs: Google Cloud Storage
+  - r2:            Cloudflare R2 (S3-compatible, free tier: 10GB)
+  - s3:            Amazon S3
+  - gcs:           Google Cloud Storage
+  - s3-compatible: Any S3-compatible provider via custom endpoint (Backblaze B2, MinIO, Wasabi, ...)
+  - webdav:        WebDAV (Nextcloud, ownCloud, etc. - self-hosted)
 
 Examples:
   claude-sync init                # Full setup wizard
   claude-sync init --passphrase   # Re-enter passphrase only (keeps storage config)
-  claude-sync init --force        # Reset everything, start fresh`,
+  claude-sync init --force        # Reset everything, start fresh
+  claude-sync init --provider s3-compatible --endpoint https://s3.us-west-004.backblazeb2.com   # Backblaze B2`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			// Show banner
 			printBanner()
@@ -152,12 +167,13 @@ Examples:
 			}
 
 			// Normal flow: full setup
-			return initFullSetup(ctx, keyPath, provider, bucket, accountID, accessKey, secretKey, s3Region, gcsProjectID, gcsCredentialsFile, usePassphrase, force)
+			return initFullSetup(ctx, keyPath, provider, bucket, accountID, accessKey, secretKey, s3Region, s3Endpoint, gcsProjectID, gcsCredentialsFile, webdavURL, webdavUsername, webdavPassword, webdavPathPrefix, scope, usePassphrase, force)
 		},
 	}
 
 	// Provider selection
-	cmd.Flags().StringVar(&provider, "provider", "", "Storage provider: r2, s3, or gcs")
+	cmd.Flags().StringVar(&provider, "provider", "", "Storage provider: r2, s3, gcs, s3-compatible, or webdav")
+	cmd.Flags().StringVar(&scope, "scope", "", "Sync scope: 'full' (default, everything) or 'sessions' (conversation history only)")
 	cmd.Flags().StringVar(&bucket, "bucket", "", "Bucket name")
 	cmd.Flags().BoolVar(&usePassphrase, "passphrase", false, "Derive encryption key from passphrase")
 	cmd.Flags().BoolVarP(&force, "force", "f", false, "Overwrite existing config/key without prompting")
@@ -168,11 +184,20 @@ Examples:
 	cmd.Flags().StringVar(&secretKey, "secret-key", "", "Secret Access Key (R2/S3)")
 
 	// S3 flags
-	cmd.Flags().StringVar(&s3Region, "region", "", "AWS Region (S3)")
+	cmd.Flags().StringVar(&s3Region, "region", "", "Region (S3 / S3-compatible)")
+
+	// S3-compatible flags
+	cmd.Flags().StringVar(&s3Endpoint, "endpoint", "", "Custom S3-compatible endpoint URL (e.g. https://s3.us-west-004.backblazeb2.com)")
 
 	// GCS flags
 	cmd.Flags().StringVar(&gcsProjectID, "project-id", "", "GCP Project ID (GCS)")
 	cmd.Flags().StringVar(&gcsCredentialsFile, "credentials-file", "", "Path to GCS credentials JSON file")
+
+	// WebDAV flags
+	cmd.Flags().StringVar(&webdavURL, "webdav-url", "", "WebDAV URL (e.g. https://cloud.example.com/remote.php/dav/files/user/)")
+	cmd.Flags().StringVar(&webdavUsername, "webdav-username", "", "WebDAV username")
+	cmd.Flags().StringVar(&webdavPassword, "webdav-password", "", "WebDAV app password")
+	cmd.Flags().StringVar(&webdavPathPrefix, "webdav-path-prefix", "claude-sync", "WebDAV path prefix (subdirectory)")
 
 	return cmd
 }
@@ -218,8 +243,36 @@ func initPassphraseOnly(ctx context.Context, keyPath string) error {
 	return nil
 }
 
+// resolveScope validates a --scope value, prompting interactively when empty.
+// Returns "full" or "sessions". "sessions" syncs only portable conversation
+// data; "full" syncs everything (the historical default).
+func resolveScope(scope string) (string, error) {
+	switch scope {
+	case config.ScopeFull, config.ScopeSessions:
+		return scope, nil
+	case "":
+		prompt := &survey.Select{
+			Message: "What should be synced?",
+			Options: []string{
+				"Sessions only — conversation history (recommended for syncing across machines)",
+				"Everything — settings, plugins, skills, agents, and sessions",
+			},
+		}
+		var c int
+		if err := survey.AskOne(prompt, &c); err != nil {
+			return "", err
+		}
+		if c == 0 {
+			return config.ScopeSessions, nil
+		}
+		return config.ScopeFull, nil
+	default:
+		return "", fmt.Errorf("invalid --scope %q (use \"full\" or \"sessions\")", scope)
+	}
+}
+
 // initFullSetup handles the full init wizard
-func initFullSetup(ctx context.Context, keyPath, provider, bucket, accountID, accessKey, secretKey, s3Region, gcsProjectID, gcsCredentialsFile string, usePassphrase, force bool) error {
+func initFullSetup(ctx context.Context, keyPath, provider, bucket, accountID, accessKey, secretKey, s3Region, s3Endpoint, gcsProjectID, gcsCredentialsFile, webdavURL, webdavUsername, webdavPassword, webdavPathPrefix, scope string, usePassphrase, force bool) error {
 	if config.Exists() && !force {
 		var overwrite bool
 		prompt := &survey.Confirm{
@@ -244,6 +297,8 @@ func initFullSetup(ctx context.Context, keyPath, provider, bucket, accountID, ac
 				"Cloudflare R2 (recommended - free tier: 10GB)",
 				"Amazon S3",
 				"Google Cloud Storage",
+				"S3-compatible (custom endpoint) — Backblaze B2, MinIO, Wasabi, ...",
+				"WebDAV (Nextcloud, ownCloud, etc. - self-hosted)",
 			},
 		}
 		var choice int
@@ -257,6 +312,10 @@ func initFullSetup(ctx context.Context, keyPath, provider, bucket, accountID, ac
 			provider = "s3"
 		case 2:
 			provider = "gcs"
+		case 3:
+			provider = "s3-compatible"
+		case 4:
+			provider = "webdav"
 		}
 	}
 
@@ -271,6 +330,10 @@ func initFullSetup(ctx context.Context, keyPath, provider, bucket, accountID, ac
 		storageCfg, err = runS3Wizard(accessKey, secretKey, s3Region, bucket)
 	case "gcs":
 		storageCfg, err = runGCSWizard(gcsProjectID, gcsCredentialsFile, bucket)
+	case "s3-compatible":
+		storageCfg, err = runS3CompatibleWizard(s3Endpoint, accessKey, secretKey, s3Region, bucket)
+	case "webdav":
+		storageCfg, err = runWebDAVWizard(webdavURL, webdavUsername, webdavPassword, webdavPathPrefix)
 	default:
 		return fmt.Errorf("unsupported provider: %s", provider)
 	}
@@ -365,9 +428,16 @@ skipKeyGen:
 	if err != nil {
 		return fmt.Errorf("could not verify bucket '%s': %w", storageCfg.Bucket, err)
 	} else if !exists {
+		if storageCfg.Provider == storage.ProviderWebDAV {
+			return fmt.Errorf("could not access WebDAV path '%s' - check your URL and credentials", storageCfg.PathPrefix)
+		}
 		return fmt.Errorf("bucket '%s' does not exist. Please create it first in your storage provider's console.\n  For R2: https://dash.cloudflare.com/ → R2 → Create bucket\n  For S3: https://console.aws.amazon.com/s3/ → Create bucket (use 'automatic' location)\n  For GCS: https://console.cloud.google.com/storage/ → Create bucket", storageCfg.Bucket)
 	}
-	printSuccess("Connected to '" + storageCfg.Bucket + "'")
+	if storageCfg.Provider == storage.ProviderWebDAV {
+		printSuccess("Connected to WebDAV ('" + storageCfg.PathPrefix + "')")
+	} else {
+		printSuccess("Connected to '" + storageCfg.Bucket + "'")
+	}
 
 	// Clear remote if user chose to start fresh
 	if shouldClearRemote {
@@ -396,10 +466,19 @@ skipKeyGen:
 		printSuccess("Encryption key verified")
 	}
 
+	// Resolve sync scope (prompts if not provided via --scope)
+	scope, err = resolveScope(scope)
+	if err != nil {
+		return err
+	}
+
 	// Save config
 	cfg := &config.Config{
 		Storage:       storageCfg,
 		EncryptionKey: "~/.claude-sync/age-key.txt",
+	}
+	if scope == config.ScopeSessions {
+		cfg.Scope = config.ScopeSessions
 	}
 
 	if err := config.Save(cfg); err != nil {
@@ -650,6 +729,94 @@ func runS3Wizard(accessKey, secretKey, region, bucket string) (*storage.StorageC
 	}, nil
 }
 
+// runS3CompatibleWizard configures any S3-compatible provider (Backblaze B2,
+// MinIO, Wasabi, DigitalOcean Spaces, ...) by collecting a custom endpoint URL.
+// It reuses the S3 storage engine (ProviderS3 with Endpoint set); the engine
+// relaxes checksum behavior for custom endpoints so these providers accept the
+// uploads. The signing region is pre-filled from the endpoint when derivable.
+func runS3CompatibleWizard(endpoint, accessKey, secretKey, region, bucket string) (*storage.StorageConfig, error) {
+	fmt.Printf("  %sS3-Compatible Setup%s\n\n", colorBold, colorReset)
+	printInfo("Works with any S3-compatible provider: Backblaze B2, MinIO, Wasabi, DigitalOcean Spaces, ...")
+	fmt.Println()
+	printInfo("You need the provider's S3 endpoint URL, an access key/secret, and a bucket.")
+	fmt.Println()
+
+	// Ask the endpoint first so the signing region can be derived from it.
+	if endpoint == "" {
+		q := &survey.Input{
+			Message: "S3 endpoint URL:",
+			Help:    "e.g. https://s3.us-west-004.backblazeb2.com (Backblaze B2)",
+		}
+		if err := survey.AskOne(q, &endpoint, survey.WithValidator(survey.Required)); err != nil {
+			return nil, err
+		}
+	}
+
+	if region == "" {
+		region = storage.RegionFromEndpoint(endpoint)
+	}
+
+	answers := struct {
+		AccessKey string
+		SecretKey string
+		Region    string
+		Bucket    string
+	}{
+		AccessKey: accessKey,
+		SecretKey: secretKey,
+		Region:    region,
+		Bucket:    bucket,
+	}
+
+	questions := []*survey.Question{
+		{
+			Name: "AccessKey",
+			Prompt: &survey.Input{
+				Message: "Access Key ID:",
+				Default: accessKey,
+			},
+			Validate: survey.Required,
+		},
+		{
+			Name: "SecretKey",
+			Prompt: &survey.Password{
+				Message: "Secret Access Key:",
+			},
+			Validate: survey.Required,
+		},
+		{
+			Name: "Region",
+			Prompt: &survey.Input{
+				Message: "Region:",
+				Default: region,
+				Help:    "Signing region, auto-detected from the endpoint. 'auto' works for providers that ignore it.",
+			},
+			Validate: survey.Required,
+		},
+		{
+			Name: "Bucket",
+			Prompt: &survey.Input{
+				Message: "Bucket name:",
+				Default: "claude-sync",
+			},
+			Validate: survey.Required,
+		},
+	}
+
+	if err := survey.Ask(questions, &answers); err != nil {
+		return nil, err
+	}
+
+	return &storage.StorageConfig{
+		Provider:        storage.ProviderS3,
+		Bucket:          answers.Bucket,
+		AccessKeyID:     answers.AccessKey,
+		SecretAccessKey: answers.SecretKey,
+		Region:          answers.Region,
+		Endpoint:        storage.NormalizeEndpoint(endpoint),
+	}, nil
+}
+
 func runGCSWizard(projectID, credentialsFile, bucket string) (*storage.StorageConfig, error) {
 	fmt.Printf("  %sGoogle Cloud Storage Setup%s\n\n", colorBold, colorReset)
 	printInfo("You need a GCS bucket and service account credentials.")
@@ -739,6 +906,91 @@ func runGCSWizard(projectID, credentialsFile, bucket string) (*storage.StorageCo
 		cfg.CredentialsFile = credPath
 	} else {
 		cfg.UseDefaultCredentials = true
+	}
+
+	return cfg, nil
+}
+
+func runWebDAVWizard(webdavURL, username, password, pathPrefix string) (*storage.StorageConfig, error) {
+	fmt.Printf("  %sWebDAV Setup (Nextcloud, ownCloud, etc.)%s\n\n", colorBold, colorReset)
+	printInfo("You need a WebDAV server URL, username, and an app password.")
+	fmt.Println()
+	fmt.Printf("  %sNextcloud:%s Go to Settings → Security → Devices & sessions\n", colorCyan, colorReset)
+	printInfo("  to create an app password (recommended over your account password)")
+	fmt.Println()
+	fmt.Printf("  %sURL format:%s https://cloud.example.com/remote.php/dav/files/USERNAME/\n", colorCyan, colorReset)
+	fmt.Println()
+
+	answers := struct {
+		URL        string
+		Username   string
+		Password   string
+		PathPrefix string
+	}{
+		URL:        webdavURL,
+		Username:   username,
+		Password:   password,
+		PathPrefix: pathPrefix,
+	}
+
+	questions := []*survey.Question{
+		{
+			Name: "URL",
+			Prompt: &survey.Input{
+				Message: "WebDAV URL:",
+				Default: webdavURL,
+				Help:    "For Nextcloud: https://your-server/remote.php/dav/files/USERNAME/",
+			},
+			Validate: survey.Required,
+		},
+		{
+			Name: "Username",
+			Prompt: &survey.Input{
+				Message: "Username:",
+				Default: username,
+			},
+			Validate: survey.Required,
+		},
+		{
+			Name: "Password",
+			Prompt: &survey.Password{
+				Message: "App password:",
+				Help:    "Use an app-specific password, not your account password",
+			},
+		},
+		{
+			Name: "PathPrefix",
+			Prompt: &survey.Input{
+				Message: "Path prefix (subdirectory for sync data):",
+				Default: func() string {
+					if pathPrefix != "" {
+						return pathPrefix
+					}
+					return "claude-sync"
+				}(),
+			},
+			Validate: survey.Required,
+		},
+	}
+
+	if err := survey.Ask(questions, &answers); err != nil {
+		return nil, err
+	}
+
+	if answers.Password == "" && password != "" {
+		answers.Password = password
+	}
+	if answers.Password == "" {
+		return nil, fmt.Errorf("app password is required")
+	}
+
+	cfg := &storage.StorageConfig{
+		Provider:       storage.ProviderWebDAV,
+		Bucket:         answers.PathPrefix,
+		WebDAVURL:      answers.URL,
+		WebDAVUsername: answers.Username,
+		WebDAVPassword: answers.Password,
+		PathPrefix:     answers.PathPrefix,
 	}
 
 	return cfg, nil
@@ -837,7 +1089,7 @@ func pushCmd() *cobra.Command {
 			}
 
 			// MCP sync if enabled
-			if includeMCP || cfg.MCPSync {
+			if includeMCP || cfg.IsMCPSyncEnabled() {
 				if err := runMCPPush(ctx, syncer); err != nil {
 					return err
 				}
@@ -881,7 +1133,7 @@ Examples:
 
 			// Check for first pull with existing local files
 			if !syncer.HasState() {
-				hasExisting, err := hasExistingClaudeFiles()
+				hasExisting, err := hasExistingClaudeFiles(cfg.Scope)
 				if err != nil {
 					return err
 				}
@@ -975,7 +1227,7 @@ Examples:
 			}
 
 			// MCP sync if enabled
-			if includeMCP || cfg.MCPSync {
+			if includeMCP || cfg.IsMCPSyncEnabled() {
 				if err := runMCPPull(ctx, syncer); err != nil {
 					return err
 				}
@@ -1961,13 +2213,13 @@ func clearRemoteStorage(ctx context.Context, store storage.Storage) error {
 }
 
 // hasExistingClaudeFiles checks if ~/.claude has any files that would be synced
-func hasExistingClaudeFiles() (bool, error) {
+func hasExistingClaudeFiles(scope string) (bool, error) {
 	claudeDir := config.ClaudeDir()
 	if _, err := os.Stat(claudeDir); os.IsNotExist(err) {
 		return false, nil
 	}
 
-	files, err := sync.GetLocalFiles(claudeDir, config.SyncPaths)
+	files, err := sync.GetLocalFiles(claudeDir, config.ScopedSyncPaths(scope))
 	if err != nil {
 		return false, err
 	}
@@ -2051,7 +2303,7 @@ func handleFirstPullWithExistingFiles(ctx context.Context, syncer *sync.Syncer, 
 	switch choice {
 	case 0:
 		// Backup and proceed
-		backupDir, err := createBackup()
+		backupDir, err := createBackup(syncer.Scope())
 		if err != nil {
 			return fmt.Errorf("failed to create backup: %w", err)
 		}
@@ -2072,7 +2324,7 @@ func handleFirstPullWithExistingFiles(ctx context.Context, syncer *sync.Syncer, 
 }
 
 // createBackup creates a backup of the current ~/.claude directory
-func createBackup() (string, error) {
+func createBackup(scope string) (string, error) {
 	claudeDir := config.ClaudeDir()
 	timestamp := time.Now().Format("20060102-150405")
 	backupDir := claudeDir + ".backup." + timestamp
@@ -2083,7 +2335,7 @@ func createBackup() (string, error) {
 	}
 
 	// Copy all syncable files to backup
-	files, err := sync.GetLocalFiles(claudeDir, config.SyncPaths)
+	files, err := sync.GetLocalFiles(claudeDir, config.ScopedSyncPaths(scope))
 	if err != nil {
 		return "", fmt.Errorf("failed to list files: %w", err)
 	}
@@ -2415,11 +2667,109 @@ func mcpCmd() *cobra.Command {
 		Long:  `Sync global MCP server configurations from ~/.claude.json across devices.`,
 	}
 	cmd.AddCommand(
+		mcpStatusCmd(),
+		mcpEnableCmd(),
+		mcpDisableCmd(),
 		mcpListCmd(),
 		mcpPushCmd(),
 		mcpPullCmd(),
 	)
 	return cmd
+}
+
+func mcpStatusCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "status",
+		Short: "Show MCP sync settings and local server state",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, err := config.Load()
+			if err != nil {
+				return err
+			}
+
+			// Auto-sync setting
+			if cfg.IsMCPSyncEnabled() {
+				fmt.Printf("  Auto-sync  %s✓ enabled%s  (included in every push/pull)\n", colorGreen, colorReset)
+			} else {
+				fmt.Printf("  Auto-sync  %s✗ disabled%s  (use --include-mcp or 'mcp push/pull')\n", colorDim, colorReset)
+			}
+
+			// Local server count + pending changes
+			syncer, err := sync.NewSyncer(cfg, quiet)
+			if err != nil {
+				return err
+			}
+			ctx := context.Background()
+			status, err := syncer.MCPStatus(ctx)
+			if err != nil {
+				return err
+			}
+
+			if status.ServerCount == 0 {
+				fmt.Printf("  Servers    %s0 servers%s in %s\n", colorDim, colorReset, config.ClaudeJSONPath())
+			} else {
+				fmt.Printf("  Servers    %d configured\n", status.ServerCount)
+			}
+
+			if status.HasChanges {
+				fmt.Printf("  Changes    %s● unpushed local changes%s\n", colorYellow, colorReset)
+			} else {
+				fmt.Printf("  Changes    %s✓ in sync%s\n", colorGreen, colorReset)
+			}
+
+			fmt.Printf("\n  %smcp enable%s   — auto-include in every push/pull\n", colorDim, colorReset)
+			fmt.Printf("  %smcp disable%s  — manual only\n", colorDim, colorReset)
+
+			return nil
+		},
+	}
+}
+
+func mcpEnableCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "enable",
+		Short: "Enable automatic MCP sync on every push/pull (syncs now too)",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, err := config.Load()
+			if err != nil {
+				return err
+			}
+
+			cfg.SetMCPSync(true)
+			if err := config.Save(cfg); err != nil {
+				return err
+			}
+			fmt.Printf("%s✓%s MCP auto-sync enabled.\n", colorGreen, colorReset)
+
+			// Push current state immediately
+			syncer, err := sync.NewSyncer(cfg, quiet)
+			if err != nil {
+				return err
+			}
+			ctx := context.Background()
+			return runMCPPush(ctx, syncer)
+		},
+	}
+}
+
+func mcpDisableCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "disable",
+		Short: "Disable automatic MCP sync on every push/pull",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, err := config.Load()
+			if err != nil {
+				return err
+			}
+
+			cfg.SetMCPSync(false)
+			if err := config.Save(cfg); err != nil {
+				return err
+			}
+			fmt.Printf("%s✓%s MCP sync disabled. Use --include-mcp flag for one-time sync.\n", colorGreen, colorReset)
+			return nil
+		},
+	}
 }
 
 func mcpListCmd() *cobra.Command {
@@ -2567,4 +2917,430 @@ func runMCPPull(ctx context.Context, syncer *sync.Syncer) error {
 		}
 	}
 	return nil
+}
+
+// autoCmd manages auto-sync hooks in Claude Code settings
+func autoCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "auto",
+		Short: "Manage auto-sync hooks for Claude Code",
+		Long: `Install or remove claude-sync hooks that automatically pull on session start
+and push on session end. Hooks are stored in ~/.claude/settings.json.`,
+	}
+
+	cmd.AddCommand(
+		autoEnableCmd(),
+		autoDisableCmd(),
+		autoStatusCmd(),
+	)
+
+	return cmd
+}
+
+func autoEnableCmd() *cobra.Command {
+	var dryRun bool
+
+	cmd := &cobra.Command{
+		Use:   "enable",
+		Short: "Install auto-sync hooks into Claude Code",
+		Long: `Adds hooks to ~/.claude/settings.json:
+  - SessionStart: runs "claude-sync pull -q" when a session begins
+  - Stop: runs "claude-sync push -q" when a session ends
+
+Existing hooks are preserved. This command is idempotent.`,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			path := claudesettings.SettingsPath("")
+
+			settings, err := claudesettings.Load(path)
+			if err != nil {
+				return fmt.Errorf("failed to load settings: %w", err)
+			}
+
+			changed := settings.EnableAutoSync()
+
+			if !changed {
+				if !quiet {
+					fmt.Printf("%s✓%s Auto-sync hooks already installed\n", colorGreen, colorReset)
+				}
+				return nil
+			}
+
+			if dryRun {
+				fmt.Printf("%s⋯%s Dry run: would install auto-sync hooks:\n", colorDim, colorReset)
+				fmt.Printf("    SessionStart → %s\n", claudesettings.HookCommandPull)
+				fmt.Printf("    Stop → %s\n", claudesettings.HookCommandPush)
+				return nil
+			}
+
+			if err := settings.Save(path); err != nil {
+				return fmt.Errorf("failed to save settings: %w", err)
+			}
+
+			if !quiet {
+				fmt.Printf("%s✓%s Auto-sync hooks installed:\n", colorGreen, colorReset)
+				fmt.Printf("    SessionStart → %s\n", claudesettings.HookCommandPull)
+				fmt.Printf("    Stop → %s\n", claudesettings.HookCommandPush)
+			}
+
+			return nil
+		},
+	}
+
+	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "Show what would be changed without modifying files")
+
+	return cmd
+}
+
+func autoDisableCmd() *cobra.Command {
+	var dryRun bool
+
+	cmd := &cobra.Command{
+		Use:   "disable",
+		Short: "Remove auto-sync hooks from Claude Code",
+		Long: `Removes claude-sync hooks from ~/.claude/settings.json.
+Other hooks are preserved. This command is idempotent.`,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			path := claudesettings.SettingsPath("")
+
+			settings, err := claudesettings.Load(path)
+			if err != nil {
+				return fmt.Errorf("failed to load settings: %w", err)
+			}
+
+			changed := settings.DisableAutoSync()
+
+			if !changed {
+				if !quiet {
+					fmt.Printf("%s✓%s Auto-sync hooks not installed\n", colorGreen, colorReset)
+				}
+				return nil
+			}
+
+			if dryRun {
+				fmt.Printf("%s⋯%s Dry run: would remove auto-sync hooks\n", colorDim, colorReset)
+				return nil
+			}
+
+			if err := settings.Save(path); err != nil {
+				return fmt.Errorf("failed to save settings: %w", err)
+			}
+
+			if !quiet {
+				fmt.Printf("%s✓%s Auto-sync hooks removed\n", colorGreen, colorReset)
+			}
+
+			return nil
+		},
+	}
+
+	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "Show what would be changed without modifying files")
+
+	return cmd
+}
+
+func autoStatusCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "status",
+		Short: "Show auto-sync hook status",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			path := claudesettings.SettingsPath("")
+
+			settings, err := claudesettings.Load(path)
+			if err != nil {
+				return fmt.Errorf("failed to load settings: %w", err)
+			}
+
+			status := settings.AutoSyncStatus()
+
+			if status.Enabled {
+				fmt.Printf("%s✓%s Auto-sync: %senabled%s\n", colorGreen, colorReset, colorGreen, colorReset)
+				if status.HasSessionStart {
+					fmt.Printf("    SessionStart → %s\n", claudesettings.HookCommandPull)
+				}
+				if status.HasStop {
+					fmt.Printf("    Stop → %s\n", claudesettings.HookCommandPush)
+				}
+			} else {
+				fmt.Printf("%s⋯%s Auto-sync: %snot installed%s\n", colorDim, colorReset, colorDim, colorReset)
+				fmt.Printf("    Run '%sclaude-sync auto enable%s' to install hooks\n", colorCyan, colorReset)
+			}
+
+			return nil
+		},
+	}
+}
+
+// pathsCmd manages sync paths and exclude filters
+func pathsCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "paths",
+		Short: "Manage sync paths and exclude filters",
+		Long: `Control which paths under ~/.claude/ are synced.
+
+Effective sync = sync_list − exclude_list
+
+Use 'paths add' to include a path, 'paths remove' to exclude it.
+Use 'paths exclude' for sub-path glob filters (e.g., skip node_modules inside plugins/).`,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return runPathsList()
+		},
+	}
+	cmd.AddCommand(
+		pathsListCmd(),
+		pathsAddCmd(),
+		pathsRemoveCmd(),
+		pathsExcludeCmd(),
+		pathsUnexcludeCmd(),
+		pathsResetCmd(),
+	)
+	return cmd
+}
+
+func pathsListCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:     "list",
+		Short:   "Show sync paths and exclude filters",
+		Aliases: []string{"ls"},
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return runPathsList()
+		},
+	}
+}
+
+func runPathsList() error {
+	cfg, err := config.Load()
+	if err != nil {
+		return err
+	}
+
+	mgr := paths.NewManager(cfg.SyncPaths, cfg.Exclude, config.ClaudeDir())
+	status := mgr.Status()
+
+	source := "default"
+	if status.IsCustomized {
+		source = "config.yaml"
+	}
+
+	fmt.Printf("\n%sSync Paths%s (%s):\n", colorBold, colorReset, source)
+	for _, p := range status.SyncPaths {
+		marker := colorGreen + "+" + colorReset
+		if !mgr.IsDefault(p) {
+			marker = colorCyan + "+" + colorReset + " (custom)"
+		}
+		fmt.Printf("  %s %s\n", marker, p)
+	}
+
+	if len(status.Excludes) > 0 {
+		fmt.Printf("\n%sExclude Filters%s:\n", colorBold, colorReset)
+		for _, e := range status.Excludes {
+			fmt.Printf("  %s-%s %s\n", colorYellow, colorReset, e)
+		}
+	}
+
+	fmt.Println()
+	return nil
+}
+
+func pathsAddCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "add <path>",
+		Short: "Add a path to sync",
+		Long: `Add a relative path under ~/.claude/ to the sync list.
+
+If the path was previously removed (and has an exclude), the
+conflicting exclude is automatically removed.`,
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, err := config.Load()
+			if err != nil {
+				return err
+			}
+
+			mgr := paths.NewManager(cfg.SyncPaths, cfg.Exclude, config.ClaudeDir())
+			result := mgr.Add(args[0])
+
+			if result.AlreadyExists {
+				fmt.Printf("%s!%s %s is already in the sync list\n", colorYellow, colorReset, args[0])
+				return nil
+			}
+
+			if result.PathMissing {
+				fmt.Printf("%s!%s %s does not exist under ~/.claude (adding anyway)\n", colorYellow, colorReset, args[0])
+			}
+
+			cfg.SyncPaths = mgr.SyncPaths()
+			cfg.Exclude = mgr.Excludes()
+			if err := config.Save(cfg); err != nil {
+				return err
+			}
+
+			fmt.Printf("%s✓%s Added %s to sync\n", colorGreen, colorReset, args[0])
+			if result.ExcludesRemoved > 0 {
+				fmt.Printf("%s✓%s Removed %d conflicting exclude(s)\n", colorGreen, colorReset, result.ExcludesRemoved)
+			}
+			return nil
+		},
+	}
+}
+
+func pathsRemoveCmd() *cobra.Command {
+	var force bool
+	cmd := &cobra.Command{
+		Use:   "remove <path>",
+		Short: "Remove a path from sync",
+		Long: `Remove a path from the sync list.
+
+Default paths are also added to excludes so they stay off after reset.
+Custom paths are simply removed from the list.`,
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, err := config.Load()
+			if err != nil {
+				return err
+			}
+
+			mgr := paths.NewManager(cfg.SyncPaths, cfg.Exclude, config.ClaudeDir())
+
+			if !mgr.HasPath(args[0]) {
+				fmt.Printf("%s!%s %s is not in the sync list\n", colorYellow, colorReset, args[0])
+				return nil
+			}
+
+			if !force {
+				var confirm bool
+				prompt := &survey.Confirm{
+					Message: fmt.Sprintf("Remove %q from sync?", args[0]),
+					Default: false,
+				}
+				if err := survey.AskOne(prompt, &confirm); err != nil || !confirm {
+					fmt.Println("  Cancelled.")
+					return nil
+				}
+			}
+
+			result := mgr.Remove(args[0])
+			cfg.SyncPaths = mgr.SyncPaths()
+			cfg.Exclude = mgr.Excludes()
+			if err := config.Save(cfg); err != nil {
+				return err
+			}
+
+			fmt.Printf("%s✓%s Removed %s from sync\n", colorGreen, colorReset, args[0])
+			if result.ExcludeAdded != "" {
+				fmt.Printf("%s✓%s Added exclude %s (survives reset)\n", colorGreen, colorReset, result.ExcludeAdded)
+			}
+			return nil
+		},
+	}
+	cmd.Flags().BoolVarP(&force, "force", "f", false, "Skip confirmation")
+	return cmd
+}
+
+func pathsExcludeCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "exclude <glob>",
+		Short: "Add a sub-path glob filter",
+		Long: `Add a glob pattern to skip files inside a synced directory.
+
+Use for filtering within a sync path (e.g., skip node_modules).
+To stop syncing a whole path, use 'paths remove' instead.
+
+Glob syntax: dir/*, dir/**, **/*.ext`,
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, err := config.Load()
+			if err != nil {
+				return err
+			}
+
+			mgr := paths.NewManager(cfg.SyncPaths, cfg.Exclude, config.ClaudeDir())
+			result := mgr.AddExclude(args[0])
+
+			if result.IsSyncPath {
+				fmt.Printf("%s!%s %q is a sync path — use 'paths remove %s' instead\n",
+					colorYellow, colorReset, args[0], args[0])
+				return nil
+			}
+
+			if result.AlreadyExists {
+				fmt.Printf("%s!%s %s is already in the exclude list\n", colorYellow, colorReset, args[0])
+				return nil
+			}
+
+			cfg.Exclude = mgr.Excludes()
+			if err := config.Save(cfg); err != nil {
+				return err
+			}
+
+			fmt.Printf("%s✓%s Added exclude filter: %s\n", colorGreen, colorReset, args[0])
+			return nil
+		},
+	}
+}
+
+func pathsUnexcludeCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "unexclude <glob>",
+		Short: "Remove a sub-path glob filter",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, err := config.Load()
+			if err != nil {
+				return err
+			}
+
+			mgr := paths.NewManager(cfg.SyncPaths, cfg.Exclude, config.ClaudeDir())
+			result := mgr.RemoveExclude(args[0])
+
+			if result.NotFound {
+				fmt.Printf("%s!%s %s not found in exclude list\n", colorYellow, colorReset, args[0])
+				return nil
+			}
+
+			cfg.Exclude = mgr.Excludes()
+			if err := config.Save(cfg); err != nil {
+				return err
+			}
+
+			fmt.Printf("%s✓%s Removed exclude filter: %s\n", colorGreen, colorReset, args[0])
+			return nil
+		},
+	}
+}
+
+func pathsResetCmd() *cobra.Command {
+	var force bool
+	cmd := &cobra.Command{
+		Use:   "reset",
+		Short: "Restore default sync paths and clear excludes",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if !force {
+				var confirm bool
+				prompt := &survey.Confirm{
+					Message: "Reset all sync paths and filters to defaults?",
+					Default: false,
+				}
+				if err := survey.AskOne(prompt, &confirm); err != nil || !confirm {
+					fmt.Println("  Cancelled.")
+					return nil
+				}
+			}
+
+			cfg, err := config.Load()
+			if err != nil {
+				return err
+			}
+
+			cfg.SyncPaths = nil
+			cfg.Exclude = nil
+			if err := config.Save(cfg); err != nil {
+				return err
+			}
+
+			fmt.Printf("%s✓%s Sync paths reset to defaults\n", colorGreen, colorReset)
+			return nil
+		},
+	}
+	cmd.Flags().BoolVarP(&force, "force", "f", false, "Skip confirmation")
+	return cmd
 }

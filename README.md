@@ -4,14 +4,14 @@
 
 <br>
 
-*Encrypted with [age](https://github.com/FiloSottile/age) • R2 / S3 / GCS supported*
+*Encrypted with [age](https://github.com/FiloSottile/age) • R2 / S3 / GCS / WebDAV supported*
 
 [![Release](https://img.shields.io/github/v/release/tawanorg/claude-sync)](https://github.com/tawanorg/claude-sync/releases)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![npm](https://img.shields.io/npm/v/@tawandotorg/claude-sync)](https://www.npmjs.com/package/@tawandotorg/claude-sync)
-[![Socket Badge](https://badge.socket.dev/npm/package/@tawandotorg/claude-sync/1.8.0)](https://badge.socket.dev/npm/package/@tawandotorg/claude-sync/1.8.0)
+[![Socket Badge](https://badge.socket.dev/npm/package/@tawandotorg/claude-sync/1.11.1)](https://badge.socket.dev/npm/package/@tawandotorg/claude-sync/1.11.1)
 
-[Quick Start](#quick-start) • [Setup Guide](#setup-guide) • [Commands](#commands) • [Auto-Sync](#auto-sync-hooks) • [Security](#security)
+[Quick Start](#quick-start) • [Setup Guide](#setup-guide) • [Commands](#commands) • [Shell Integration](#shell-integration) • [Security](#security)
 
 </div>
 
@@ -20,14 +20,15 @@
 ## Features
 
 - **Cross-device sync**: Continue Claude Code conversations on any laptop
-- **Multi-provider storage**: Cloudflare R2, AWS S3, or Google Cloud Storage
+- **Multi-provider storage**: Cloudflare R2, AWS S3, Google Cloud Storage, S3-compatible (Backblaze B2, MinIO, Wasabi), or WebDAV (Nextcloud, ownCloud)
 - **End-to-end encryption**: All files encrypted with age before upload
 - **Passphrase-based keys**: Same passphrase = same key on any device (no file copying)
+- **Selective sync**: Choose `--scope sessions` to sync only conversation data (skip plugins/node_modules)
 - **Interactive wizard**: Arrow-key driven setup with validation
-- **Self-updating**: `claude-sync update` to get the latest version
+- **Secure self-updating**: `claude-sync update` downloads and verifies SHA256 checksums
 - **Simple CLI**: `push`, `pull`, `status`, `diff`, `conflicts` commands
 - **Compression**: Gzip compression before encryption for faster syncs
-- **Auto-sync hooks**: Optional Claude Code hooks for automatic push/pull
+- **Shell integration**: Optional shell hooks for automatic push/pull
 
 <div align="center">
 <img src="assets/claude-sync.gif" alt="Claude Sync Demo" width="100%">
@@ -56,7 +57,7 @@ npm install -g @tawandotorg/claude-sync
 
 # Set up with SAME storage credentials
 claude-sync init
-# Select same provider (R2/S3/GCS)
+# Select same provider (R2/S3/GCS/WebDAV)
 # Enter same bucket name and credentials
 # Choose "Passphrase" for encryption
 # Enter the SAME passphrase as first device
@@ -80,6 +81,8 @@ claude-sync pull
 | **Cloudflare R2** | 10GB storage | Personal use (recommended) |
 | **AWS S3** | 5GB (12 months) | AWS users |
 | **Google Cloud Storage** | 5GB | GCP users |
+| **S3-compatible** | varies | Backblaze B2, MinIO, Wasabi, DigitalOcean Spaces, self-hosted |
+| **WebDAV** | Self-hosted (unlimited) | Nextcloud/ownCloud users |
 
 ### Step 2: Create a Bucket
 
@@ -114,6 +117,35 @@ You'll need: Access Key ID, Secret Access Key, Region
 You'll need: Project ID, Service Account JSON file (or use `gcloud auth application-default login`)
 </details>
 
+<details>
+<summary><b>S3-compatible</b> (Backblaze B2, MinIO, Wasabi, DigitalOcean Spaces, ...)</summary>
+
+Any provider exposing an S3-compatible API works through the **S3-compatible (custom endpoint)** option. Create a bucket and an application key with your provider, then supply its S3 endpoint URL.
+
+Example (Backblaze B2):
+
+```bash
+claude-sync init --provider s3-compatible --endpoint https://s3.us-west-004.backblazeb2.com
+```
+
+You'll need: Endpoint URL, Access Key ID, Secret Access Key, Bucket. The signing region is auto-detected from the endpoint (e.g. `us-west-004`); for providers that ignore it, `auto` is used.
+
+> Custom endpoints automatically relax the AWS SDK's default integrity-checksum headers, which some S3-compatible providers reject. AWS S3 behavior is unchanged.
+</details>
+
+<details>
+<summary><b>WebDAV (Nextcloud, ownCloud, etc.)</b></summary>
+
+No bucket to create — just point at your existing WebDAV server.
+
+1. **Nextcloud**: Go to Settings → Security → Devices & sessions → Create app password
+2. Note your WebDAV URL: `https://your-server/remote.php/dav/files/USERNAME/`
+
+You'll need: WebDAV URL, Username, App password
+
+The wizard will create a `claude-sync` subdirectory automatically.
+</details>
+
 ### Step 3: Run Init
 
 ```bash
@@ -122,7 +154,7 @@ claude-sync init
 
 The interactive wizard will guide you through:
 
-1. **Select storage provider** (R2, S3, or GCS)
+1. **Select storage provider** (R2, S3, GCS, or WebDAV)
 2. **Enter credentials** (provider-specific)
 3. **Choose encryption method**:
    - **Passphrase** (recommended) - same passphrase on all devices = same key
@@ -154,6 +186,21 @@ claude-sync pull
 | `~/.claude/settings.json` | Settings |
 | `~/.claude/settings.local.json` | Local settings |
 | `~/.claude/CLAUDE.md` | Global instructions |
+
+### Sync scope
+
+`init` asks whether to sync everything or just conversation data; you can also set it with `--scope`:
+
+| Scope | Syncs | Use when |
+|-------|-------|----------|
+| `full` (default) | everything in the table above | you want settings, skills, agents, and plugins mirrored too |
+| `sessions` | `projects/`, `history.jsonl`, `tasks/`, `plans/` only | you just want `claude --resume` to work across machines |
+
+```bash
+claude-sync init --scope sessions
+```
+
+**Why `sessions` exists:** `full` includes `plugins/`, whose plugin caches bundle `node_modules` and Python `.venv` trees — thousands of large, machine-/arch-specific files that are regenerated on demand and should not be synced. `sessions` skips them, keeping syncs small, fast, and portable. The scope is saved in `~/.claude-sync/config.yaml` and applies to every `push`/`pull`.
 
 ## Cross-Device Path Mapping
 
@@ -238,20 +285,6 @@ claude-sync changelog            # Show recent releases
 claude-sync changelog --limit 5  # Show last 5 releases
 ```
 
-## Auto-Sync Hooks
-
-Automatically sync when starting or exiting Claude Code sessions using built-in hooks.
-
-```bash
-claude-sync auto enable   # Install auto-sync hooks into Claude Code
-claude-sync auto disable  # Remove auto-sync hooks
-claude-sync auto status   # Show current hook status
-```
-
-When enabled, hooks will:
-- **SessionStart**: Pull latest changes from remote
-- **Stop**: Push local changes to remote
-
 ## Exclude Patterns
 
 Skip specific files or directories during sync by adding exclude patterns to your config (`~/.claude-sync/config.yaml`):
@@ -272,12 +305,18 @@ Add to `~/.zshrc` or `~/.bashrc`:
 ```bash
 # Auto-pull on shell start
 if command -v claude-sync &> /dev/null; then
-  claude-sync pull -q &
+  # Run in a subshell so the job is detached from the parent shell's
+  # job table — avoids interactive `[1] 12345` / `[1] + done` noise.
+  (claude-sync pull -q &) >/dev/null 2>&1
 fi
 
 # Auto-push on shell exit
 trap 'claude-sync push -q' EXIT
 ```
+
+> **Note:** The subshell wrapper `(cmd &)` prevents zsh/bash from printing job control
+> messages (`[1] 12345` on start and `[1] + done cmd` on completion) every time you open
+> a terminal. A plain `claude-sync pull -q &` works but produces noisy shell prompts.
 
 ## Pulling with Existing Files
 
@@ -346,7 +385,8 @@ claude-sync push             # Re-upload from this device
 - Passphrase-derived keys use Argon2 (memory-hard KDF)
 - Passphrase is never stored - only the derived key at `~/.claude-sync/age-key.txt`
 - Cloud storage is private (API key/IAM auth)
-- Config files stored with 0600 permissions
+- Config files and downloads stored with 0600/0700 permissions (user-only)
+- Self-update verifies SHA256 checksums before installing new binaries
 - Backward compatible: can read both compressed and uncompressed remote files
 
 ## Cost
@@ -358,6 +398,7 @@ Claude sessions typically use < 50MB. Syncing is effectively **free** on any pro
 | **Cloudflare R2** | 10GB storage, 1M writes, 10M reads/month |
 | **AWS S3** | 5GB for 12 months (then ~$0.023/GB) |
 | **Google Cloud Storage** | 5GB, 5K writes, 50K reads/month |
+| **WebDAV** | Self-hosted — no limits, no cost beyond your own server |
 
 ## Installation Options
 

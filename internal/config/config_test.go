@@ -3,11 +3,36 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
 	"github.com/tawanorg/claude-sync/internal/storage"
 )
+
+func TestScopedSyncPaths(t *testing.T) {
+	t.Run("sessions scope is limited to portable session data", func(t *testing.T) {
+		got := ScopedSyncPaths("sessions")
+		want := []string{"projects", "history.jsonl", "tasks", "plans"}
+		if !reflect.DeepEqual(got, want) {
+			t.Errorf("ScopedSyncPaths(\"sessions\") = %v, want %v", got, want)
+		}
+		for _, p := range got {
+			if p == "plugins" {
+				t.Fatal("sessions scope must never include plugins (bundles node_modules/.venv)")
+			}
+		}
+	})
+
+	t.Run("full, empty, and unknown scopes return the complete SyncPaths", func(t *testing.T) {
+		for _, scope := range []string{"full", "", "bogus"} {
+			got := ScopedSyncPaths(scope)
+			if !reflect.DeepEqual(got, SyncPaths) {
+				t.Errorf("ScopedSyncPaths(%q) = %v, want full SyncPaths %v", scope, got, SyncPaths)
+			}
+		}
+	})
+}
 
 func TestConfigDirPath(t *testing.T) {
 	path := ConfigDirPath()
@@ -287,12 +312,13 @@ func TestConfigSaveAndLoad(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	mcpEnabled := true
 	cfg := &Config{
 		EncryptionKey: "~/.claude-sync/age-key.txt",
 		Bucket:        "test-bucket",
 		AccountID:     "test-account",
 		Exclude:       []string{"*.tmp", "cache/**"},
-		MCPSync:       true,
+		MCPSync:       &mcpEnabled,
 	}
 
 	// Write config manually to test Load
@@ -369,6 +395,17 @@ func TestIsExcluded(t *testing.T) {
 		{"partial name no match", "plugins/cachedata/file.txt", []string{"plugins/cache/**"}, false},
 		{"shell-snapshots", "shell-snapshots/snap.json", []string{"shell-snapshots/**"}, true},
 		{"telemetry dir", "telemetry/data.json", []string{"telemetry/**"}, true},
+
+		// Recursive globstar patterns (Issue #43)
+		{"globstar .git at root", ".git/HEAD", []string{"**/.git/**"}, true},
+		{"globstar .git nested", "projects/someproject/.git/config", []string{"**/.git/**"}, true},
+		{"globstar .git deeply nested", "projects/foo/bar/.git/objects/ab/cd", []string{"**/.git/**"}, true},
+		{"globstar .git dir itself", "projects/app/.git", []string{"**/.git/**"}, true},
+		{"globstar non-matching", "projects/app/git/config", []string{"**/.git/**"}, false},
+		{"globstar node_modules anywhere", "projects/foo/node_modules/lodash/index.js", []string{"**/node_modules/**"}, true},
+		{"globstar node_modules deep", "a/b/c/d/node_modules/pkg/lib/file.js", []string{"**/node_modules/**"}, true},
+		{"leading ** with extension", "deeply/nested/path/file.log", []string{"**/*.log"}, true},
+		{"combined patterns from issue", "projects/foo/.git/objects/ab", []string{"*.tmp", "projects/*/node_modules/*", "**/.git/**"}, true},
 	}
 
 	for _, tt := range tests {
@@ -380,4 +417,106 @@ func TestIsExcluded(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestGetEffectiveSyncPaths(t *testing.T) {
+	tests := []struct {
+		name      string
+		syncPaths []string
+		scope     string
+		wantLen   int
+	}{
+		{
+			name:      "empty SyncPaths returns defaults",
+			syncPaths: nil,
+			scope:     "",
+			wantLen:   len(SyncPaths),
+		},
+		{
+			name:      "custom SyncPaths overrides defaults",
+			syncPaths: []string{"CLAUDE.md", "settings.json"},
+			scope:     "",
+			wantLen:   2,
+		},
+		{
+			name:      "sessions scope without custom paths",
+			syncPaths: nil,
+			scope:     ScopeSessions,
+			wantLen:   len(SessionSyncPaths),
+		},
+		{
+			name:      "custom SyncPaths overrides sessions scope",
+			syncPaths: []string{"custom-only"},
+			scope:     ScopeSessions,
+			wantLen:   1,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := &Config{SyncPaths: tt.syncPaths, Scope: tt.scope}
+			got := cfg.GetEffectiveSyncPaths()
+			if len(got) != tt.wantLen {
+				t.Errorf("GetEffectiveSyncPaths() returned %d paths, want %d", len(got), tt.wantLen)
+			}
+		})
+	}
+}
+
+func TestIsMCPSyncEnabled(t *testing.T) {
+	tests := []struct {
+		name    string
+		mcpSync *bool
+		want    bool
+	}{
+		{
+			name:    "nil (unset) returns false",
+			mcpSync: nil,
+			want:    false,
+		},
+		{
+			name:    "true returns true",
+			mcpSync: boolPtr(true),
+			want:    true,
+		},
+		{
+			name:    "false returns false",
+			mcpSync: boolPtr(false),
+			want:    false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := &Config{MCPSync: tt.mcpSync}
+			if got := cfg.IsMCPSyncEnabled(); got != tt.want {
+				t.Errorf("IsMCPSyncEnabled() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestSetMCPSync(t *testing.T) {
+	cfg := &Config{}
+
+	// Initially nil
+	if cfg.MCPSync != nil {
+		t.Error("MCPSync should be nil initially")
+	}
+
+	// Enable
+	cfg.SetMCPSync(true)
+	if cfg.MCPSync == nil || !*cfg.MCPSync {
+		t.Error("SetMCPSync(true) should set MCPSync to true")
+	}
+
+	// Disable
+	cfg.SetMCPSync(false)
+	if cfg.MCPSync == nil || *cfg.MCPSync {
+		t.Error("SetMCPSync(false) should set MCPSync to false")
+	}
+}
+
+func boolPtr(b bool) *bool {
+	return &b
 }
